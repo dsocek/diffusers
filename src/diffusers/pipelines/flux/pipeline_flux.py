@@ -15,6 +15,8 @@
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
+import math
+import time
 import numpy as np
 import torch
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -135,6 +137,88 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+def warmup_inference_steps_time_adjustment(
+    start_time_after_warmup, start_time_after_inference_steps_warmup, num_inference_steps, warmup_steps
+):
+    """
+    Adjust start time after warmup to account for warmup inference steps.
+
+    When warmup is applied to multiple inference steps within a single sample generation we need to account for
+    skipped inference steps time to estimate "per sample generation time".  This function computes the average
+    inference time per step and adjusts the start time after warmup accordingly.
+
+    Args:
+        start_time_after_warmup: time after warmup steps have been performed
+        start_time_after_inference_steps_warmup: time after warmup inference steps have been performed
+        num_inference_steps: total number of inference steps per sample generation
+        warmup_steps: number of warmup steps
+
+    Returns:
+        [float]: adjusted start time after warmup which accounts for warmup inference steps based on average non-warmup steps time
+    """
+    if num_inference_steps > warmup_steps:
+        avg_time_per_inference_step = (time.time() - start_time_after_inference_steps_warmup) / (
+            num_inference_steps - warmup_steps
+        )
+        start_time_after_warmup -= avg_time_per_inference_step * warmup_steps
+    return start_time_after_warmup
+
+
+def speed_metrics(
+    split: str,
+    start_time: float,
+    num_samples: int = None,
+    num_steps: int = None,
+    num_tokens: int = None,
+    start_time_after_warmup: float = None,
+    log_evaluate_save_time: float = None,
+) -> Dict[str, float]:
+    """
+    Measure and return speed performance metrics.
+
+    This function requires a time snapshot `start_time` before the operation to be measured starts and this function
+    should be run immediately after the operation to be measured has completed.
+
+    Args:
+        split (str): name to prefix metric (like train, eval, test...)
+        start_time (float): operation start time
+        num_samples (int, optional): number of samples processed. Defaults to None.
+        num_steps (int, optional): number of steps performed. Defaults to None.
+        num_tokens (int, optional): number of tokens processed. Defaults to None.
+        start_time_after_warmup (float, optional): time after warmup steps have been performed. Defaults to None.
+        log_evaluate_save_time (float, optional): time spent to log, evaluate and save. Defaults to None.
+
+    Returns:
+        Dict[str, float]: dictionary with performance metrics.
+    """
+
+    runtime = time.time() - start_time
+    result = {f"{split}_runtime": round(runtime, 4)}
+    if runtime == 0:
+        return result
+
+    # Adjust runtime if log_evaluate_save_time should not be included
+    if log_evaluate_save_time is not None:
+        runtime = runtime - log_evaluate_save_time
+
+    # Adjust runtime if there were warmup steps
+    if start_time_after_warmup is not None:
+        runtime = runtime + start_time - start_time_after_warmup
+
+    # Compute throughputs
+    if num_samples is not None:
+        samples_per_second = num_samples / runtime
+        result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
+    if num_steps is not None:
+        steps_per_second = num_steps / runtime
+        result[f"{split}_steps_per_second"] = round(steps_per_second, 3)
+    if num_tokens is not None:
+        tokens_per_second = num_tokens / runtime
+        result[f"{split}_tokens_per_second"] = round(tokens_per_second, 3)
+
+    return result
 
 
 class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
@@ -526,6 +610,86 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
     def interrupt(self):
         return self._interrupt
 
+    @classmethod
+    def _split_inputs_into_batches(
+        cls, batch_size, latents, prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids, guidance
+    ):
+        # Use torch.split to generate num_batches batches of size batch_size
+        latents_batches = list(torch.split(latents, batch_size))
+        prompt_embeds_batches = list(torch.split(prompt_embeds, batch_size))
+        if pooled_prompt_embeds is not None:
+            pooled_prompt_embeds_batches = list(torch.split(pooled_prompt_embeds, batch_size))
+        if text_ids is not None:
+            text_ids_batches = list(torch.split(text_ids, batch_size))
+        if latent_image_ids is not None:
+            latent_image_ids_batches = list(torch.split(latent_image_ids, batch_size))
+        if guidance is not None:
+            guidance_batches = list(torch.split(guidance, batch_size))
+
+        # If the last batch has less samples than batch_size, pad it with dummy samples
+        num_dummy_samples = 0
+        if latents_batches[-1].shape[0] < batch_size:
+            num_dummy_samples = batch_size - latents_batches[-1].shape[0]
+
+            # Pad latents_batches
+            sequence_to_stack = (latents_batches[-1],) + tuple(
+                torch.zeros_like(latents_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            latents_batches[-1] = torch.vstack(sequence_to_stack)
+
+            # Pad prompt_embeds_batches
+            sequence_to_stack = (prompt_embeds_batches[-1],) + tuple(
+                torch.zeros_like(prompt_embeds_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+            )
+            prompt_embeds_batches[-1] = torch.vstack(sequence_to_stack)
+
+            # Pad pooled_prompt_embeds if necessary
+            if pooled_prompt_embeds is not None:
+                sequence_to_stack = (pooled_prompt_embeds_batches[-1],) + tuple(
+                    torch.zeros_like(pooled_prompt_embeds_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                pooled_prompt_embeds_batches[-1] = torch.vstack(sequence_to_stack)
+
+            # Pad text_ids_batches if necessary
+            if text_ids is not None:
+                sequence_to_stack = (text_ids_batches[-1],) + tuple(
+                    torch.zeros_like(text_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                text_ids_batches[-1] = torch.vstack(sequence_to_stack)
+
+            # Pad latent_image_ids if necessary
+            if latent_image_ids is not None:
+                sequence_to_stack = (latent_image_ids_batches[-1],) + tuple(
+                    torch.zeros_like(latent_image_ids_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                latent_image_ids_batches[-1] = torch.vstack(sequence_to_stack)
+
+            # Pad guidance if necessary
+            if guidance is not None:
+                sequence_to_stack = (guidance_batches[-1],) + tuple(
+                    torch.zeros_like(guidance_batches[-1][0][None, :]) for _ in range(num_dummy_samples)
+                )
+                guidance_batches[-1] = torch.vstack(sequence_to_stack)
+
+        # Stack batches in the same tensor
+        latents_batches = torch.stack(latents_batches)
+        prompt_embeds_batches = torch.stack(prompt_embeds_batches)
+        pooled_prompt_embeds_batches = torch.stack(pooled_prompt_embeds_batches)
+        text_ids_batches = torch.stack(text_ids_batches)
+        latent_image_ids_batches = torch.stack(latent_image_ids_batches)
+        guidance_batches = torch.stack(guidance_batches)
+
+        return (
+            latents_batches,
+            prompt_embeds_batches,
+            pooled_prompt_embeds_batches,
+            text_ids_batches,
+            latent_image_ids_batches,
+            guidance_batches,
+            num_dummy_samples,
+        )
+
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -537,6 +701,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         num_inference_steps: int = 28,
         timesteps: List[int] = None,
         guidance_scale: float = 3.5,
+        batch_size: int = 1,
         num_images_per_prompt: Optional[int] = 1,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
@@ -548,6 +713,9 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        profiling_warmup_steps: Optional[int] = 0,
+        profiling_steps: Optional[int] = 0,
+        **kwargs,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -640,11 +808,12 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
+            num_prompts = 1
         elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
+            num_prompts = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            num_prompts = prompt_embeds.shape[0]
+        num_batches = math.ceil((num_images_per_prompt * num_prompts) / batch_size)
 
         device = self._execution_device
 
@@ -669,7 +838,7 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_image_ids = self.prepare_latents(
-            batch_size * num_images_per_prompt,
+            num_prompts * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
@@ -678,6 +847,8 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
             generator,
             latents,
         )
+        text_ids = text_ids.unsqueeze(0)
+        latent_image_ids = latent_image_ids.unsqueeze(0)
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
@@ -707,60 +878,162 @@ class FluxPipeline(DiffusionPipeline, FluxLoraLoaderMixin, FromSingleFileMixin):
         else:
             guidance = None
 
+        print("Precision: {self.transformer.dtype}")
+        print(
+            f"{num_prompts} prompt(s) received, {num_images_per_prompt} generation(s) per prompt,"
+            f" {batch_size} sample(s) per batch, {num_batches} total batch(es)."
+        )
+
+        throughput_warmup_steps = kwargs.get("throughput_warmup_steps", 3)
+        use_warmup_inference_steps = (
+            num_batches <= throughput_warmup_steps and num_inference_steps > throughput_warmup_steps
+        )
+
+        torch.cuda.synchronize()
+        t0 = time.time()
+        t1 = t0
+
+        # 5.1. Split Input data to batches
+        (
+            latents_batches,
+            text_embeddings_batches,
+            pooled_prompt_embeddings_batches,
+            text_ids_batches,
+            latent_image_ids_batches,
+            guidance_batches,
+            num_dummy_samples,
+        ) = self._split_inputs_into_batches(
+            batch_size, latents, prompt_embeds, pooled_prompt_embeds, text_ids, latent_image_ids, guidance
+        )
+
+        outputs = {
+            "images": [],
+        }
+
         # 6. Denoising loop
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
+        for j in range(num_batches):
+
+            if j == throughput_warmup_steps:
+                torch.cuda.synchronize()
+                t1 = time.time()
+
+            latents_batch = latents_batches[0]
+            latents_batches = torch.roll(latents_batches, shifts=-1, dims=0)
+            text_embeddings_batch = text_embeddings_batches[0]
+            text_embeddings_batches = torch.roll(text_embeddings_batches, shifts=-1, dims=0)
+            pooled_prompt_embeddings_batch = pooled_prompt_embeddings_batches[0]
+            pooled_prompt_embeddings_batches = torch.roll(pooled_prompt_embeddings_batches, shifts=-1, dims=0)
+            text_ids_batch = text_ids_batches[0]
+            text_ids_batches = torch.roll(text_ids_batches, shifts=-1, dims=0)
+            latent_image_ids_batch = latent_image_ids_batches[0]
+            latent_image_ids_batches = torch.roll(latent_image_ids_batches, shifts=-1, dims=0)
+            guidance_batch = guidance_batches[0]
+            guidance_batches = torch.roll(guidance_batches, shifts=-1, dims=0)
+
+            if hasattr(self.scheduler, "_init_step_index"):
+                # Reset scheduler step index for next batch
+                self.scheduler.timesteps = timesteps
+                self.scheduler._init_step_index(timesteps[0])
+
+            for i in self.progress_bar(range(len(timesteps))):
+                if use_warmup_inference_steps and i == throughput_warmup_steps and j == num_batches - 1:
+                    torch.cuda.synchronize()
+                    t1 = time.time()
+
                 if self.interrupt:
                     continue
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                t = timesteps[0]
+                timesteps = torch.roll(timesteps, shifts=-1, dims=0)
+                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                timestep = t.expand(latents_batch.shape[0]).to(latents_batch.dtype)
 
                 noise_pred = self.transformer(
-                    hidden_states=latents,
+                    hidden_states=latents_batch,
                     timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    guidance=guidance_batch,
+                    pooled_projections=pooled_prompt_embeddings_batch,
+                    encoder_hidden_states=text_embeddings_batch,
+                    txt_ids=text_ids_batch.squeeze(0),
+                    img_ids=latent_image_ids_batch.squeeze(0),
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
 
                 # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                latents_dtype = latents_batch.dtype
+                latents_batch = self.scheduler.step(noise_pred, t, latents_batch, return_dict=False)[0]
 
-                if latents.dtype != latents_dtype:
+                if latents_batch.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+                        latents_batch = latents_batch.to(latents_dtype)
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+                #torch.cuda.synchronize()
 
-        if output_type == "latent":
-            image = latents
+            #torch.cuda.synchronize()
+            #ttt = time.time()
+            if output_type == "latent":
+                image = latents_batch
 
-        else:
-            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-            image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            else:
+                latents_batch = self._unpack_latents(latents_batch, height, width, self.vae_scale_factor)
+                latents_batch = (latents_batch / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                #print(self.vae.device)
+                #ttt1 = time.time()
+                image = self.vae.decode(latents_batch, return_dict=False)[0]
+                #print(f"{time.time() - ttt1}")
+                #ttt1 = time.time()
+                image = self.image_processor.postprocess(image, output_type=output_type)
+                #print(f"{time.time() - ttt1}")
+
+            outputs["images"].append(image)
+            #torch.cuda.synchronize()
+            #print(f"{time.time() - ttt}")
+
+        torch.cuda.synchronize()
+        speed_metrics_prefix = "generation"
+        if use_warmup_inference_steps:
+            t1 = warmup_inference_steps_time_adjustment(t1, t1, num_inference_steps, throughput_warmup_steps)
+        speed_measures = speed_metrics(
+            split=speed_metrics_prefix,
+            start_time=t0,
+            num_samples=batch_size
+            if t1 == t0 or use_warmup_inference_steps
+            else (num_batches - throughput_warmup_steps) * batch_size,
+            num_steps=batch_size * num_inference_steps
+            if use_warmup_inference_steps
+            else (num_batches - throughput_warmup_steps) * batch_size * num_inference_steps,
+            start_time_after_warmup=t1,
+        )
+        print(f"Speed metrics: {speed_measures}")
+
+        # 8 Output Images
+        if num_dummy_samples > 0:
+            # Remove dummy generations if needed
+            outputs["images"][-1] = outputs["images"][-1][:-num_dummy_samples]
+
+        # Process generated images
+        for i, image in enumerate(outputs["images"][:]):
+            if i == 0:
+                outputs["images"].clear()
+
+            if output_type == "pil" and isinstance(image, list):
+                outputs["images"] += image
+            elif output_type in ["np", "numpy"] and isinstance(image, np.ndarray):
+                if len(outputs["images"]) == 0:
+                    outputs["images"] = image
+                else:
+                    outputs["images"] = np.concatenate((outputs["images"], image), axis=0)
+            else:
+                if len(outputs["images"]) == 0:
+                    outputs["images"] = image
+                else:
+                    outputs["images"] = torch.cat((outputs["images"], image), 0)
+
 
         # Offload all models
         self.maybe_free_model_hooks()
