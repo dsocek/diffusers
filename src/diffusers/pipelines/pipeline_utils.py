@@ -496,6 +496,30 @@ class DiffusionPipeline(ConfigMixin, PushToHubMixin):
                 )
         return self
 
+    def migrate_to(self, device):
+        r"""
+        Performs Pipeline device migration. This is applicable to accelerators such as Intel Gaudi where migration
+        toolkit can be used to automatically map specific API calls to the appropriate accelerator equivalent.
+
+        Arguments:
+            device (str):
+                Specified migration target accelerator device.
+
+        Returns:
+            [`DiffusionPipeline`]: The pipeline migrated to specified `device`.
+        """
+        if device == "hpu":
+            # Enable Intel Gaudi generic support
+            os.environ["PT_HPU_GPU_MIGRATION"] = "1"
+            os.environ["PT_HPU_MAX_COMPOUND_OP_SIZE"] = "1"
+
+            import habana_frameworks.torch.core as htcore # noqa: F401
+        else:
+            raise ValueError(
+                "Unknown migration target accelerator device. Current valid choices are ('hpu')"
+            )
+        return self.to(device)
+
     @property
     def device(self) -> torch.device:
         r"""
